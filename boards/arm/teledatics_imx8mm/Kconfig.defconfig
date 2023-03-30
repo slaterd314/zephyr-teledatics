@@ -1,0 +1,18 @@
+# MIMX8MM EVK board defconfig
+
+# Copyright (c) 2020, Manivannan Sadhasivam <mani@kernel.org>
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_TELEDATICS_IMX8MM
+
+config BOARD
+	default "teledatics_imx8mm"
+
+if !XIP
+config FLASH_SIZE
+	default 0
+config FLASH_BASE_ADDRESS
+	default 0
+endif
+
+endif # BOARD_TELEDATICS_IMX8MM
