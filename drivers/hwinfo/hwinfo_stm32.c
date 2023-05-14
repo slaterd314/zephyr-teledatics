@@ -113,11 +113,28 @@ int z_impl_hwinfo_get_reset_cause(uint32_t *cause)
 		flags |= RESET_LOW_POWER_WAKE;
 	}
 #endif
-#if defined(PWR_FLAG_SB)
+
+#if defined(CONFIG_SOC_SERIES_STM32H7X) && defined(CORE_CM4)
+	if (LL_PWR_CPU2_IsActiveFlag_SB()) {
+		flags |= RESET_LOW_POWER_WAKE;
+	}
+#elif defined(CONFIG_SOC_SERIES_STM32H7X) && defined(CORE_CM7)
+	if (LL_PWR_CPU_IsActiveFlag_SB()) {
+		flags |= RESET_LOW_POWER_WAKE;
+	}
+#elif defined(CONFIG_SOC_SERIES_STM32MP1X)
+	if (LL_PWR_MCU_IsActiveFlag_SB()) {
+		flags |= RESET_LOW_POWER_WAKE;
+	}
+#elif defined(CONFIG_SOC_SERIES_STM32WLX) || defined(CONFIG_SOC_SERIES_STM32WBX)
+	if (LL_PWR_IsActiveFlag_C1SB()) {
+		flags |= RESET_LOW_POWER_WAKE;
+	}
+#elif defined(PWR_FLAG_SB)
 	if (LL_PWR_IsActiveFlag_SB()) {
 		flags |= RESET_LOW_POWER_WAKE;
 	}
-#endif
+#endif /* PWR_FLAG_SB */
 
 	*cause = flags;
 
@@ -127,9 +144,19 @@ int z_impl_hwinfo_get_reset_cause(uint32_t *cause)
 int z_impl_hwinfo_clear_reset_cause(void)
 {
 	LL_RCC_ClearResetFlags();
-#if defined(PWR_FLAG_SB)
+
+#if defined(CONFIG_SOC_SERIES_STM32H7X) && defined(CORE_CM4)
+	LL_PWR_ClearFlag_CPU2();
+#elif defined(CONFIG_SOC_SERIES_STM32H7X) && defined(CORE_CM7)
+	LL_PWR_ClearFlag_CPU();
+#elif defined(CONFIG_SOC_SERIES_STM32MP1X)
+	LL_PWR_ClearFlag_MCU();
+#elif defined(CONFIG_SOC_SERIES_STM32WLX) || defined(CONFIG_SOC_SERIES_STM32WBX)
+	LL_PWR_ClearFlag_C1STOP_C1STB();
+#elif defined(PWR_FLAG_SB)
 	LL_PWR_ClearFlag_SB();
-#endif
+#endif /* PWR_FLAG_SB */
+
 	return 0;
 }
 

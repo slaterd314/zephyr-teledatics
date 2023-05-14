@@ -70,13 +70,13 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 /* Shared set of in-flight LwM2M messages */
 static struct lwm2m_message messages[CONFIG_LWM2M_ENGINE_MAX_MESSAGES];
+static struct lwm2m_block_context block1_contexts[NUM_BLOCK1_CONTEXT];
 
 /* External resources */
 sys_slist_t *lwm2m_engine_obj_list(void);
 
 sys_slist_t *lwm2m_engine_obj_inst_list(void);
 
-struct lwm2m_block_context *lwm2m_block1_context(void);
 /* block-wise transfer functions */
 
 enum coap_block_size lwm2m_default_block_size(void)
@@ -100,22 +100,33 @@ enum coap_block_size lwm2m_default_block_size(void)
 
 	return COAP_BLOCK_256;
 }
-static int init_block_ctx(const uint8_t *token, uint8_t tkl, struct lwm2m_block_context **ctx)
+
+void lwm2m_clear_block_contexts(void)
+{
+	(void)memset(block1_contexts, 0, sizeof(block1_contexts));
+}
+
+static int init_block_ctx(const struct lwm2m_obj_path *path, struct lwm2m_block_context **ctx)
 {
 	int i;
 	int64_t timestamp;
 
+	if (!path) {
+		LOG_ERR("Null block ctx path");
+		return -EFAULT;
+	}
+
 	*ctx = NULL;
 	timestamp = k_uptime_get();
 	for (i = 0; i < NUM_BLOCK1_CONTEXT; i++) {
-		if (lwm2m_block1_context()[i].tkl == 0U) {
-			*ctx = &lwm2m_block1_context()[i];
+		if (block1_contexts[i].path.level == 0U) {
+			*ctx = &block1_contexts[i];
 			break;
 		}
 
-		if (timestamp - lwm2m_block1_context()[i].timestamp >
+		if (timestamp - block1_contexts[i].timestamp >
 		    TIMEOUT_BLOCKWISE_TRANSFER_MS) {
-			*ctx = &lwm2m_block1_context()[i];
+			*ctx = &block1_contexts[i];
 			/* TODO: notify application for block
 			 * transfer timeout
 			 */
@@ -128,8 +139,7 @@ static int init_block_ctx(const uint8_t *token, uint8_t tkl, struct lwm2m_block_
 		return -ENOMEM;
 	}
 
-	(*ctx)->tkl = tkl;
-	memcpy((*ctx)->token, token, tkl);
+	memcpy(&(*ctx)->path, path, sizeof(struct lwm2m_obj_path));
 	coap_block_transfer_init(&(*ctx)->ctx, lwm2m_default_block_size(), 0);
 	(*ctx)->timestamp = timestamp;
 	(*ctx)->expected = 0;
@@ -139,16 +149,21 @@ static int init_block_ctx(const uint8_t *token, uint8_t tkl, struct lwm2m_block_
 	return 0;
 }
 
-static int get_block_ctx(const uint8_t *token, uint8_t tkl, struct lwm2m_block_context **ctx)
+static int get_block_ctx(const struct lwm2m_obj_path *path, struct lwm2m_block_context **ctx)
 {
 	int i;
+
+	if (!path) {
+		LOG_ERR("Null block ctx path");
+		return -EFAULT;
+	}
 
 	*ctx = NULL;
 
 	for (i = 0; i < NUM_BLOCK1_CONTEXT; i++) {
-		if (lwm2m_block1_context()[i].tkl == tkl &&
-		    memcmp(token, lwm2m_block1_context()[i].token, tkl) == 0) {
-			*ctx = &lwm2m_block1_context()[i];
+		if (memcmp(path, &block1_contexts[i].path,
+			  sizeof(struct lwm2m_obj_path)) == 0) {
+			*ctx = &block1_contexts[i];
 			/* refresh timestamp */
 			(*ctx)->timestamp = k_uptime_get();
 			break;
@@ -168,7 +183,7 @@ static void free_block_ctx(struct lwm2m_block_context *ctx)
 		return;
 	}
 
-	ctx->tkl = 0U;
+	memset(&ctx->path, 0, sizeof(struct lwm2m_obj_path));
 }
 
 void lwm2m_engine_context_close(struct lwm2m_ctx *client_ctx)
@@ -2002,9 +2017,9 @@ int handle_request(struct coap_packet *request, struct lwm2m_message *msg)
 		/* Try to retrieve existing block context. If one not exists,
 		 * and we've received first block, allocate new context.
 		 */
-		r = get_block_ctx(token, tkl, &block_ctx);
+		r = get_block_ctx(&msg->path, &block_ctx);
 		if (r < 0 && block_num == 0) {
-			r = init_block_ctx(token, tkl, &block_ctx);
+			r = init_block_ctx(&msg->path, &block_ctx);
 		}
 
 		if (r < 0) {
@@ -2878,6 +2893,7 @@ static int do_send_reply_cb(const struct coap_packet *response, struct coap_repl
 			    const struct sockaddr *from)
 {
 	uint8_t code;
+	struct lwm2m_message *msg = (struct lwm2m_message *)reply->user_data;
 
 	code = coap_header_get_code(response);
 	LOG_DBG("Send callback (code:%u.%u)", COAP_RESPONSE_CODE_CLASS(code),
@@ -2885,17 +2901,27 @@ static int do_send_reply_cb(const struct coap_packet *response, struct coap_repl
 
 	if (code == COAP_RESPONSE_CODE_CHANGED) {
 		LOG_INF("Send done!");
+		if (msg && msg->send_status_cb) {
+			msg->send_status_cb(LWM2M_SEND_STATUS_SUCCESS);
+		}
 		return 0;
 	}
 
 	LOG_ERR("Failed with code %u.%u. Not Retrying.", COAP_RESPONSE_CODE_CLASS(code),
 		COAP_RESPONSE_CODE_DETAIL(code));
 
+	if (msg && msg->send_status_cb) {
+		msg->send_status_cb(LWM2M_SEND_STATUS_FAILURE);
+	}
+
 	return 0;
 }
 
 static void do_send_timeout_cb(struct lwm2m_message *msg)
 {
+	if (msg->send_status_cb) {
+		msg->send_status_cb(LWM2M_SEND_STATUS_TIMEOUT);
+	}
 	LOG_WRN("Send Timeout");
 	lwm2m_rd_client_timeout(msg->ctx);
 }
@@ -2935,8 +2961,8 @@ static bool init_next_pending_timeseries_data(struct lwm2m_cache_read_info *cach
 }
 #endif
 
-int lwm2m_send(struct lwm2m_ctx *ctx, const struct lwm2m_obj_path path_list[],
-	       uint8_t path_list_size, bool confirmation_request)
+int lwm2m_send_cb(struct lwm2m_ctx *ctx, const struct lwm2m_obj_path path_list[],
+			 uint8_t path_list_size, lwm2m_send_cb_t reply_cb)
 {
 #if defined(CONFIG_LWM2M_SERVER_OBJECT_VERSION_1_1)
 	struct lwm2m_message *msg;
@@ -3005,15 +3031,9 @@ msg_alloc:
 
 msg_init:
 
-	if (confirmation_request) {
-		msg->type = COAP_TYPE_CON;
-		msg->reply_cb = do_send_reply_cb;
-		msg->message_timeout_cb = do_send_timeout_cb;
-	} else {
-		msg->type = COAP_TYPE_NON_CON;
-		msg->reply_cb = NULL;
-		msg->message_timeout_cb = NULL;
-	}
+	msg->type = COAP_TYPE_CON;
+	msg->reply_cb = do_send_reply_cb;
+	msg->message_timeout_cb = do_send_timeout_cb;
 	msg->code = COAP_METHOD_POST;
 	msg->mid = coap_next_id();
 	msg->tkl = LWM2M_MSG_TOKEN_GENERATE_NEW;
@@ -3026,6 +3046,12 @@ msg_init:
 #if defined(CONFIG_LWM2M_RESOURCE_DATA_CACHE_SUPPORT)
 	msg->cache_info = &cache_temp_info;
 #endif
+
+	/* Register user callback if defined for confirmation */
+	if (reply_cb) {
+		msg->reply->user_data = msg;
+		msg->send_status_cb = reply_cb;
+	}
 
 	ret = select_writer(&msg->out, content_format);
 	if (ret) {
@@ -3082,6 +3108,16 @@ cleanup:
 #endif
 }
 
+int lwm2m_send(struct lwm2m_ctx *ctx, const struct lwm2m_obj_path path_list[],
+			 uint8_t path_list_size, bool confirmation_request)
+{
+	if (!confirmation_request) {
+		return -EINVAL;
+	}
+
+	return lwm2m_send_cb(ctx, path_list, path_list_size, NULL);
+}
+
 int lwm2m_engine_send(struct lwm2m_ctx *ctx, char const *path_list[], uint8_t path_list_size,
 		      bool confirmation_request)
 {
@@ -3100,5 +3136,5 @@ int lwm2m_engine_send(struct lwm2m_ctx *ctx, char const *path_list[], uint8_t pa
 		}
 	}
 
-	return lwm2m_send(ctx, lwm2m_path_list, path_list_size, confirmation_request);
+	return lwm2m_send_cb(ctx, lwm2m_path_list, path_list_size, NULL);
 }
