@@ -182,7 +182,7 @@ struct can_frame {
 	/** The frame payload data. */
 	union {
 		uint8_t data[CAN_MAX_DLEN];
-		uint32_t data_32[ceiling_fraction(CAN_MAX_DLEN, sizeof(uint32_t))];
+		uint32_t data_32[DIV_ROUND_UP(CAN_MAX_DLEN, sizeof(uint32_t))];
 	};
 };
 
@@ -618,7 +618,11 @@ struct can_device_state {
 		stats_init(&state->stats.s_hdr, STATS_SIZE_32, 7,	\
 			   STATS_NAME_INIT_PARMS(can));			\
 		stats_register(dev->name, &(state->stats.s_hdr));	\
-		return init_fn(dev);					\
+		if (init_fn != NULL) {					\
+			return init_fn(dev);				\
+		}							\
+									\
+		return 0;						\
 	}
 
 /** @endcond */
@@ -715,6 +719,7 @@ static inline int z_impl_can_get_core_clock(const struct device *dev, uint32_t *
  * @param dev Pointer to the device structure for the driver instance.
  * @param[out] max_bitrate Maximum supported bitrate in bits/s
  *
+ * @retval 0 If successful.
  * @retval -EIO General input/output error.
  * @retval -ENOSYS If this function is not implemented by the driver.
  */

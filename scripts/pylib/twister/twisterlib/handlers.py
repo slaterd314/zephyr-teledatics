@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # vim: set syntax=python ts=4 :
 #
-# Copyright (c) 20180-2022 Intel Corporation
+# Copyright (c) 2018-2022 Intel Corporation
 # Copyright 2022 NXP
 # SPDX-License-Identifier: Apache-2.0
 
@@ -19,6 +19,7 @@ import select
 import re
 import psutil
 from twisterlib.environment import ZEPHYR_BASE
+from twisterlib.error import TwisterException
 sys.path.insert(0, os.path.join(ZEPHYR_BASE, "scripts/pylib/build_helpers"))
 from domains import Domains
 
@@ -115,6 +116,8 @@ class Handler:
         (and not in reverse).
         """
         expected_suite_names = self.instance.testsuite.ztest_suite_names
+        logger.debug(f"Expected suite names:{expected_suite_names}")
+        logger.debug(f"Detected suite names:{detected_suite_names}")
         if not expected_suite_names or \
                 not harness_state == "passed":
             return
@@ -145,7 +148,8 @@ class Handler:
         harness_class_name = type(harness).__name__
         if self.suite_name_check and harness_class_name == "Test":
             self._verify_ztest_suite_name(harness.state, harness.detected_suite_names, handler_time)
-
+            if self.instance.status == 'failed':
+                return
             if not harness.matched_run_id and harness.run_id_exists:
                 self.instance.status = "failed"
                 self.instance.execution_time = handler_time
@@ -374,6 +378,12 @@ class DeviceHandler(Handler):
             except OSError:
                 time.sleep(0.001)
                 continue
+            except TypeError:
+                # This exception happens if the serial port was closed and
+                # its file descriptor cleared in between of ser.isOpen()
+                # and ser.in_waiting checks.
+                logger.debug("Serial port is already closed, stop reading.")
+                break
 
             serial_line = None
             try:
@@ -405,11 +415,14 @@ class DeviceHandler(Handler):
     def device_is_available(self, instance):
         device = instance.platform.name
         fixture = instance.testsuite.harness_config.get("fixture")
+        dut_found = False
+
         for d in self.duts:
             if fixture and fixture not in d.fixtures:
                 continue
             if d.platform != device or (d.serial is None and d.serial_pty is None):
                 continue
+            dut_found = True
             d.lock.acquire()
             avail = False
             if d.available:
@@ -419,6 +432,9 @@ class DeviceHandler(Handler):
             d.lock.release()
             if avail:
                 return d
+
+        if not dut_found:
+            raise TwisterException(f"No device to serve as {device} platform.")
 
         return None
 
@@ -444,10 +460,16 @@ class DeviceHandler(Handler):
     def handle(self):
         runner = None
 
-        hardware = self.device_is_available(self.instance)
-        while not hardware:
-            time.sleep(1)
+        try:
             hardware = self.device_is_available(self.instance)
+            while not hardware:
+                time.sleep(1)
+                hardware = self.device_is_available(self.instance)
+        except TwisterException as error:
+            self.instance.status = "failed"
+            self.instance.reason = str(error)
+            logger.error(self.instance.reason)
+            return
 
         runner = hardware.runner or self.options.west_runner
         serial_pty = hardware.serial_pty
@@ -523,6 +545,10 @@ class DeviceHandler(Handler):
         if pre_script:
             self.run_custom_script(pre_script, 30)
 
+        flash_timeout = hardware.flash_timeout
+        if hardware.flash_with_test:
+            flash_timeout += self.timeout
+
         try:
             ser = serial.Serial(
                 serial_device,
@@ -530,7 +556,7 @@ class DeviceHandler(Handler):
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 bytesize=serial.EIGHTBITS,
-                timeout=self.timeout
+                timeout=max(flash_timeout, self.timeout)  # the worst case of no serial input
             )
         except serial.SerialException as e:
             self.instance.status = "failed"
@@ -557,8 +583,8 @@ class DeviceHandler(Handler):
 
         t = threading.Thread(target=self.monitor_serial, daemon=True,
                              args=(ser, halt_monitor_evt, harness))
-        t.start()
         start_time = time.time()
+        t.start()
 
         d_log = "{}/device.log".format(self.instance.build_dir)
         logger.debug('Flash command: %s', command)
@@ -567,7 +593,7 @@ class DeviceHandler(Handler):
             stdout = stderr = None
             with subprocess.Popen(command, stderr=subprocess.PIPE, stdout=subprocess.PIPE) as proc:
                 try:
-                    (stdout, stderr) = proc.communicate(timeout=60)
+                    (stdout, stderr) = proc.communicate(timeout=flash_timeout)
                     # ignore unencodable unicode chars
                     logger.debug(stdout.decode(errors = "ignore"))
 
@@ -599,6 +625,7 @@ class DeviceHandler(Handler):
             self.run_custom_script(post_flash_script, 30)
 
         if not flash_error:
+            # Always wait at most the test timeout here after flashing.
             t.join(self.timeout)
         else:
             # When the flash error is due exceptions,
@@ -633,11 +660,10 @@ class DeviceHandler(Handler):
             self.instance.status = "failed"
             self.instance.reason = "Timeout"
 
-        if self.instance.status == "error":
+        if self.instance.status in ["error", "failed"]:
             self.instance.add_missing_case_status("blocked", self.instance.reason)
 
-        if not flash_error:
-            self._final_handle_actions(harness, handler_time)
+        self._final_handle_actions(harness, handler_time)
 
         if post_script:
             self.run_custom_script(post_script, 30)

@@ -158,7 +158,7 @@ static int get_tim_clk(const struct stm32_pclken *pclken, uint32_t *tim_clk)
 
 	clk = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
 
-	r = clock_control_get_rate(clk, (clock_control_subsys_t *)pclken,
+	r = clock_control_get_rate(clk, (clock_control_subsys_t)pclken,
 				   &bus_clk);
 	if (r < 0) {
 		return r;
@@ -643,7 +643,7 @@ static int pwm_stm32_init(const struct device *dev)
 		return -ENODEV;
 	}
 
-	r = clock_control_on(clk, (clock_control_subsys_t *)&cfg->pclken);
+	r = clock_control_on(clk, (clock_control_subsys_t)&cfg->pclken);
 	if (r < 0) {
 		LOG_ERR("Could not initialize clock (%d)", r);
 		return r;
@@ -692,13 +692,29 @@ static int pwm_stm32_init(const struct device *dev)
 }
 
 #ifdef CONFIG_PWM_CAPTURE
-#define IRQ_CONFIG_FUNC(index)                                                 \
-static void pwm_stm32_irq_config_func_##index(const struct device *dev)        \
-{                                                                              \
-	IRQ_CONNECT(DT_IRQN(DT_INST_PARENT(index)),                            \
-			DT_IRQ(DT_INST_PARENT(index), priority),               \
-			pwm_stm32_isr, DEVICE_DT_INST_GET(index), 0);          \
-	irq_enable(DT_IRQN(DT_INST_PARENT(index)));                            \
+#define IRQ_CONNECT_AND_ENABLE_BY_NAME(index, name)				\
+{										\
+	IRQ_CONNECT(DT_IRQ_BY_NAME(DT_INST_PARENT(index), name, irq),		\
+			DT_IRQ_BY_NAME(DT_INST_PARENT(index), name, priority),	\
+			pwm_stm32_isr, DEVICE_DT_INST_GET(index), 0);		\
+	irq_enable(DT_IRQ_BY_NAME(DT_INST_PARENT(index), name, irq));		\
+}
+
+#define IRQ_CONNECT_AND_ENABLE_DEFAULT(index)					\
+{										\
+	IRQ_CONNECT(DT_IRQN(DT_INST_PARENT(index)),				\
+			DT_IRQ(DT_INST_PARENT(index), priority),		\
+			pwm_stm32_isr, DEVICE_DT_INST_GET(index), 0);		\
+	irq_enable(DT_IRQN(DT_INST_PARENT(index)));				\
+}
+
+#define IRQ_CONFIG_FUNC(index)                                                  \
+static void pwm_stm32_irq_config_func_##index(const struct device *dev)		\
+{										\
+	COND_CODE_1(DT_IRQ_HAS_NAME(DT_INST_PARENT(index), cc),			\
+		(IRQ_CONNECT_AND_ENABLE_BY_NAME(index, cc)),			\
+		(IRQ_CONNECT_AND_ENABLE_DEFAULT(index))				\
+	);									\
 }
 #define CAPTURE_INIT(index)                                                    \
 	.irq_config_func = pwm_stm32_irq_config_func_##index
